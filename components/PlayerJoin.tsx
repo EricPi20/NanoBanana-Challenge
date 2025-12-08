@@ -85,7 +85,7 @@ export default function PlayerJoin() {
       router.push('/game');
     } catch (error) {
       console.error('Error joining game:', error);
-      alert('Blimey! Failed to join the game. Check yer Firebase configuration!');
+      alert('Blimey! Failed to join the game. Check yer Supabase configuration!');
       setIsJoining(false);
     }
   };
