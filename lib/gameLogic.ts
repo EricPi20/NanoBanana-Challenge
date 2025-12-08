@@ -400,7 +400,7 @@ export const checkSubmissionsAndTransition = async (): Promise<void> => {
 };
 
 // Check if all eligible players have voted (using current game state)
-const checkAllPlayersVoted = (gameState: GameState): boolean => {
+export const checkAllPlayersVoted = (gameState: GameState): boolean => {
   if (!gameState || gameState.phase !== 'voting') {
     return false;
   }

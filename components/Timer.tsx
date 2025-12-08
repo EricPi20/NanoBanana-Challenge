@@ -1,13 +1,15 @@
 'use client';
 
 import { useEffect, useState, useRef } from 'react';
-import { GamePhase } from '@/types/game';
+import { GamePhase, GameState } from '@/types/game';
+import { checkAllPlayersVoted } from '@/lib/gameLogic';
 
 interface TimerProps {
   startedAt: number | null;
   duration: number; // in seconds
   onComplete?: () => void;
   phase?: GamePhase; // 'creating' or 'voting'
+  gameState?: GameState | null; // Game state to check if all players have voted
 }
 
 // Audio context for generating sounds
@@ -154,12 +156,12 @@ function playJeopardyMusic() {
   }
 }
 
-export default function Timer({ startedAt, duration, onComplete, phase }: TimerProps) {
+export default function Timer({ startedAt, duration, onComplete, phase, gameState }: TimerProps) {
   const [timeLeft, setTimeLeft] = useState<number>(duration);
   const tickIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const musicIntervalRef = useRef<(() => void) | null>(null);
   const jeopardyAudioRef = useRef<HTMLAudioElement | null>(null);
-  const faceOffAudioRef = useRef<HTMLAudioElement | null>(null);
+  const votingAudioRef = useRef<HTMLAudioElement | null>(null);
   const lastSecondRef = useRef<number>(duration);
   const hasPlayedBuzzRef = useRef<boolean>(false);
 
@@ -168,13 +170,13 @@ export default function Timer({ startedAt, duration, onComplete, phase }: TimerP
     if (typeof window !== 'undefined') {
       if (!jeopardyAudioRef.current) {
         jeopardyAudioRef.current = new Audio('/jeopardy-themelq.mp3');
-        jeopardyAudioRef.current.volume = 0.7;
+        jeopardyAudioRef.current.volume = 0.4;
         jeopardyAudioRef.current.loop = true;
       }
-      if (!faceOffAudioRef.current) {
-        faceOffAudioRef.current = new Audio('/face-off.mp3');
-        faceOffAudioRef.current.volume = 0.7;
-        faceOffAudioRef.current.loop = true;
+      if (!votingAudioRef.current) {
+        votingAudioRef.current = new Audio('/Lyrics_trimmed.mp3');
+        votingAudioRef.current.volume = 0.4;
+        votingAudioRef.current.loop = true;
       }
     }
   }, []);
@@ -194,9 +196,9 @@ export default function Timer({ startedAt, duration, onComplete, phase }: TimerP
         jeopardyAudioRef.current.pause();
         jeopardyAudioRef.current.currentTime = 0;
       }
-      if (faceOffAudioRef.current) {
-        faceOffAudioRef.current.pause();
-        faceOffAudioRef.current.currentTime = 0;
+      if (votingAudioRef.current) {
+        votingAudioRef.current.pause();
+        votingAudioRef.current.currentTime = 0;
       }
     };
 
@@ -254,10 +256,10 @@ export default function Timer({ startedAt, duration, onComplete, phase }: TimerP
           tickIntervalRef.current = null;
         }
         
-        // Stop face-off sound when voting timer ends
-        if (phase === 'voting' && faceOffAudioRef.current) {
-          faceOffAudioRef.current.pause();
-          faceOffAudioRef.current.currentTime = 0;
+        // Stop voting sound when voting timer ends
+        if (phase === 'voting' && votingAudioRef.current) {
+          votingAudioRef.current.pause();
+          votingAudioRef.current.currentTime = 0;
         }
         
         // Play appropriate buzz sound based on phase
@@ -288,24 +290,44 @@ export default function Timer({ startedAt, duration, onComplete, phase }: TimerP
         jeopardyAudioRef.current.pause();
         jeopardyAudioRef.current.currentTime = 0;
       }
-      // Start face-off sound when voting starts
-      if (faceOffAudioRef.current && startedAt) {
+      
+      // Start voting music when voting starts
+      // The music will loop automatically (loop=true) until all players vote or time expires
+      if (votingAudioRef.current && startedAt && timeLeft > 0) {
         // Only start playing if not already playing
-        if (faceOffAudioRef.current.paused) {
-          faceOffAudioRef.current.currentTime = 0;
-          faceOffAudioRef.current.play().catch((error) => {
-            console.error('Error playing face-off sound:', error);
+        if (votingAudioRef.current.paused) {
+          votingAudioRef.current.currentTime = 0;
+          votingAudioRef.current.play().catch((error) => {
+            console.error('Error playing voting sound:', error);
           });
         }
       }
     } else if (phase !== 'creating') {
-      // Stop face-off sound when voting phase ends (transition to results, lobby, etc.)
-      if (faceOffAudioRef.current) {
-        faceOffAudioRef.current.pause();
-        faceOffAudioRef.current.currentTime = 0;
+      // Stop voting sound when voting phase ends (transition to results, lobby, etc.)
+      if (votingAudioRef.current) {
+        votingAudioRef.current.pause();
+        votingAudioRef.current.currentTime = 0;
       }
     }
-  }, [phase, startedAt]);
+  }, [phase, startedAt, timeLeft]);
+  
+  // Check if all players have voted and stop music accordingly
+  // Loop if one minute is not yet over and voting is not yet over
+  useEffect(() => {
+    if (phase === 'voting' && gameState && startedAt) {
+      const allVoted = checkAllPlayersVoted(gameState);
+      if (allVoted && votingAudioRef.current && !votingAudioRef.current.paused) {
+        // Stop music when all players have voted
+        votingAudioRef.current.pause();
+        votingAudioRef.current.currentTime = 0;
+      } else if (!allVoted && timeLeft > 0 && votingAudioRef.current && votingAudioRef.current.paused) {
+        // Resume playing if not all voted and time is still remaining (loop continues)
+        votingAudioRef.current.play().catch((error) => {
+          console.error('Error playing voting sound:', error);
+        });
+      }
+    }
+  }, [gameState, phase, startedAt, timeLeft]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -314,9 +336,9 @@ export default function Timer({ startedAt, duration, onComplete, phase }: TimerP
         jeopardyAudioRef.current.pause();
         jeopardyAudioRef.current = null;
       }
-      if (faceOffAudioRef.current) {
-        faceOffAudioRef.current.pause();
-        faceOffAudioRef.current = null;
+      if (votingAudioRef.current) {
+        votingAudioRef.current.pause();
+        votingAudioRef.current = null;
       }
     };
   }, []);

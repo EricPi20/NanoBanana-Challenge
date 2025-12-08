@@ -29,7 +29,17 @@ export default function GameBoard() {
   const [uploading, setUploading] = useState(false);
   const [expandedImageUrl, setExpandedImageUrl] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const lobbyAudioRef = useRef<HTMLAudioElement | null>(null);
   const router = useRouter();
+
+  // Initialize lobby audio element
+  useEffect(() => {
+    if (typeof window !== 'undefined' && !lobbyAudioRef.current) {
+      lobbyAudioRef.current = new Audio('/Lyrics_.mp3');
+      lobbyAudioRef.current.volume = 0.3;
+      lobbyAudioRef.current.loop = true;
+    }
+  }, []);
 
   useEffect(() => {
     // Get player info from localStorage
@@ -47,6 +57,37 @@ export default function GameBoard() {
 
     return () => unsubscribe();
   }, [router]);
+
+  // Handle lobby music - play when in lobby, stop when game starts
+  useEffect(() => {
+    if (!gameState || !lobbyAudioRef.current) return;
+
+    if (gameState.phase === 'lobby') {
+      // Play lobby music when in lobby phase
+      if (lobbyAudioRef.current.paused) {
+        lobbyAudioRef.current.currentTime = 0;
+        lobbyAudioRef.current.play().catch((error) => {
+          console.error('Error playing lobby music:', error);
+        });
+      }
+    } else {
+      // Stop lobby music when phase changes from lobby to anything else
+      if (!lobbyAudioRef.current.paused) {
+        lobbyAudioRef.current.pause();
+        lobbyAudioRef.current.currentTime = 0;
+      }
+    }
+  }, [gameState?.phase]);
+
+  // Cleanup lobby audio on unmount
+  useEffect(() => {
+    return () => {
+      if (lobbyAudioRef.current) {
+        lobbyAudioRef.current.pause();
+        lobbyAudioRef.current = null;
+      }
+    };
+  }, []);
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -213,6 +254,7 @@ export default function GameBoard() {
               duration={gameState.timerDuration}
               onComplete={handleTimerComplete}
               phase={gameState.phase}
+              gameState={gameState}
             />
             {gameState.phase === 'voting' && (
               <p className="text-center text-gray-600 mt-2 text-sm">
