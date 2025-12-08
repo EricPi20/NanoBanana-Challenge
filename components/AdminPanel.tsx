@@ -221,7 +221,7 @@ export default function AdminPanel({ gameState, isAdmin }: AdminPanelProps) {
         {showCategoryUpload && (
           <div className="space-y-3 mt-3">
             <p className="text-sm opacity-90">
-              Upload a CSV file with columns: <strong>category</strong> (must be "easy", "medium", or "hard") and <strong>image_descr</strong>. 
+              Upload a CSV file with columns: <strong>category</strong> (must be &quot;easy&quot;, &quot;medium&quot;, or &quot;hard&quot;) and <strong>image_descr</strong>. 
               The app will randomly select one description when a round starts based on the round type.
             </p>
             <div className="bg-white bg-opacity-20 p-2 rounded text-xs font-mono">
