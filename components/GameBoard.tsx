@@ -16,11 +16,13 @@ import ImageModal from '@/components/ImageModal';
 let heic2any: any = null;
 if (typeof window !== 'undefined') {
   // @ts-ignore - heic2any may not be installed
-  import('heic2any').then((module) => {
-    heic2any = module.default;
-  }).catch(() => {
-    console.warn('heic2any not available - HEIC conversion will not work');
-  });
+  import('heic2any')
+    .then((module) => {
+      heic2any = module.default;
+    })
+    .catch(() => {
+      console.warn('heic2any not available - HEIC conversion will not work');
+    });
 }
 
 export default function GameBoard() {
@@ -35,25 +37,27 @@ export default function GameBoard() {
   // Initialize lobby audio element
   useEffect(() => {
     if (typeof window !== 'undefined' && !lobbyAudioRef.current) {
-      lobbyAudioRef.current = new Audio('/Lyrics_.mp3');
+      lobbyAudioRef.current = new Audio('/lobby-music.mp3');
       lobbyAudioRef.current.volume = 0.3;
       lobbyAudioRef.current.loop = true;
     }
   }, []);
 
   useEffect(() => {
-    // Get player info from localStorage
+    // Get player info and session from localStorage
     const playerId = localStorage.getItem('playerId');
+    const sessionId = localStorage.getItem('sessionId') || 'main'; // Fallback to 'main' for backward compatibility
+    
     if (!playerId) {
       router.push('/');
       return;
     }
     setCurrentPlayerId(playerId);
 
-    // Subscribe to game state
+    // Subscribe to game state for this session
     const unsubscribe = subscribeToGameState((state) => {
       setGameState(state);
-    });
+    }, sessionId);
 
     return () => unsubscribe();
   }, [router]);
@@ -161,6 +165,7 @@ export default function GameBoard() {
       const formData = new FormData();
       formData.append('file', fileToUpload);
       formData.append('playerId', currentPlayerId);
+      formData.append('sessionId', sessionId);
 
       const response = await fetch('/api/upload', {
         method: 'POST',
@@ -185,6 +190,7 @@ export default function GameBoard() {
 
   const handleTimerComplete = async () => {
     if (!gameState) return;
+    const sessionId = localStorage.getItem('sessionId') || 'main';
     
     if (gameState.phase === 'creating') {
       // Move to voting phase (this shouldn't happen now since we auto-transition)
@@ -192,12 +198,13 @@ export default function GameBoard() {
       await supabase
         .from('game_state')
         .update({ phase: 'voting' })
-        .eq('id', 'main');
+        .eq('session_id', sessionId);
     } else if (gameState.phase === 'voting') {
       // Voting timer completed - consolidate scores
-      await consolidateVotingScores();
+      await consolidateVotingScores(sessionId);
     }
   };
+
 
   if (!supabase) {
     return <SupabaseConfigError />;
@@ -218,6 +225,16 @@ export default function GameBoard() {
   const canVote = !isSelectedPlayer && gameState.phase === 'voting';
   const currentPlayer = gameState.players[currentPlayerId];
   const hasSubmitted = gameState.submissions[currentPlayerId] !== undefined;
+  const sessionId = localStorage.getItem('sessionId') || 'main';
+
+  // Debug: Log admin status
+  console.log('[GameBoard] Admin Check:', {
+    currentPlayerId,
+    adminId: gameState.adminId,
+    isAdmin,
+    players: Object.keys(gameState.players || {}),
+    currentPlayerName: currentPlayer?.name
+  });
 
   return (
     <div className="min-h-screen p-4 md:p-8">
@@ -225,11 +242,29 @@ export default function GameBoard() {
         {/* Header */}
         <div className="text-center mb-8">
           <h1 className="text-5xl font-bold text-banana-600 mb-2">🍌 Nano Banana Challenge</h1>
+          {/* Session Code Display */}
+          {sessionId && sessionId !== 'main' && (
+            <div className="mb-4">
+              <div className="inline-block bg-banana-100 border-4 border-banana-400 rounded-xl px-6 py-3 shadow-lg">
+                <p className="text-sm font-semibold text-gray-700 mb-1">Session Code</p>
+                <p className="text-3xl font-bold text-banana-700 tracking-widest">{sessionId}</p>
+                <p className="text-xs text-gray-600 mt-1">Share this code with players to join</p>
+              </div>
+            </div>
+          )}
           <div className="flex items-center justify-center space-x-4 mt-4">
             <div className="bg-white rounded-lg px-4 py-2 shadow-md">
               <span className="text-2xl mr-2">{currentPlayer?.icon}</span>
               <span className="font-semibold">{currentPlayer?.name}</span>
+              {isAdmin && <span className="ml-2 text-xs bg-banana-500 text-white px-2 py-1 rounded">⚓ CAPTAIN</span>}
             </div>
+            {gameState.adminId && !isAdmin && gameState.players[gameState.adminId] && (
+              <div className="bg-yellow-100 rounded-lg px-4 py-2 shadow-md border-2 border-yellow-400">
+                <span className="text-sm font-semibold text-yellow-800">
+                  ⚓ Captain: {gameState.players[gameState.adminId].name}
+                </span>
+              </div>
+            )}
             {gameState.currentRound && (
               <div className={`rounded-lg px-4 py-2 shadow-md font-bold text-white ${
                 gameState.currentRound === 'easy' ? 'bg-green-500' :
@@ -243,7 +278,9 @@ export default function GameBoard() {
         </div>
 
         {/* Admin Panel */}
-        {isAdmin && <AdminPanel gameState={gameState} isAdmin={isAdmin} />}
+        {isAdmin && gameState && (
+          <AdminPanel gameState={gameState} isAdmin={isAdmin} />
+        )}
 
         {/* Timer */}
         {(gameState.phase === 'creating' || gameState.phase === 'voting') && gameState.timerStartedAt && (

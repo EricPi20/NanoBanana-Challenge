@@ -42,7 +42,8 @@ export default function VotingArea({
     setVoting(true);
     
     try {
-      await submitVote(currentPlayerId, submissionId);
+      const sessionId = typeof window !== 'undefined' ? (localStorage.getItem('sessionId') || 'main') : 'main';
+      await submitVote(currentPlayerId, submissionId, sessionId);
       setHasVoted(true);
     } catch (error) {
       console.error('Error voting:', error);

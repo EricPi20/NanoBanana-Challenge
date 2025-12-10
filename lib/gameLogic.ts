@@ -1,6 +1,153 @@
 import { getSupabaseClient } from './supabase';
 import { GameState, Player, RoundType } from '@/types/game';
 
+// Generate a random session code (6 characters, alphanumeric)
+export const generateSessionCode = (): string => {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Exclude confusing chars like 0, O, I, 1
+  let result = '';
+  for (let i = 0; i < 6; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+};
+
+// Create a new game session
+export const createSession = async (playerId: string): Promise<string> => {
+  const supabase = getSupabaseClient();
+  
+  // Generate a unique session ID (try up to 10 times to avoid collisions)
+  let sessionId = generateSessionCode();
+  let attempts = 0;
+  const maxAttempts = 10;
+  
+  while (attempts < maxAttempts) {
+    // Check if session already exists (try with session_id first, fallback to id)
+    let existing = null;
+    const { data: dataWithSessionId, error: errorSessionId } = await supabase
+      .from('game_state')
+      .select('id')
+      .eq('session_id', sessionId)
+      .single();
+    
+    // If session_id column exists and we found data, use it
+    if (dataWithSessionId) {
+      existing = dataWithSessionId;
+    } else if (errorSessionId && (
+      errorSessionId.message?.toLowerCase().includes('session_id') ||
+      errorSessionId.message?.toLowerCase().includes('column') ||
+      errorSessionId.code === '42703' ||
+      errorSessionId.code === 'PGRST116' // Not found is OK
+    )) {
+      // If column doesn't exist or not found, check by id as fallback
+      if (errorSessionId.code !== 'PGRST116') {
+        // Column doesn't exist, check by id
+        const { data: dataById } = await supabase
+          .from('game_state')
+          .select('id')
+          .eq('id', sessionId)
+          .single();
+        existing = dataById;
+      }
+      // If PGRST116 (not found), existing stays null which is correct
+    }
+    
+    if (!existing) {
+      break; // Session ID is unique
+    }
+    
+    // Generate a new one if collision
+    sessionId = generateSessionCode();
+    attempts++;
+  }
+  
+  if (attempts >= maxAttempts) {
+    throw new Error('Failed to generate unique session code. Please try again.');
+  }
+  
+  // Create game state for this session
+  const defaultState = getDefaultGameState();
+  
+  // Try with all columns first (if migration has been run)
+  let error = null;
+  const { error: errorWithAllColumns } = await supabase.from('game_state').upsert({
+    id: sessionId,
+    session_id: sessionId,
+    admin_id: playerId,
+    phase: defaultState.phase,
+    round_number: defaultState.roundNumber,
+    timer_duration: defaultState.timerDuration,
+    selected_players: defaultState.selectedPlayers,
+    round_winners: defaultState.roundWinners,
+    easy_round_players: defaultState.easyRoundPlayers,
+    current_category_image_descr: defaultState.currentCategoryImageDescr,
+  }, { onConflict: 'id' });
+  
+  // If error is about missing columns, try without them (backward compatibility)
+  if (errorWithAllColumns && (
+    errorWithAllColumns.message?.toLowerCase().includes('session_id') ||
+    errorWithAllColumns.message?.toLowerCase().includes('easy_round_players') ||
+    errorWithAllColumns.message?.toLowerCase().includes('column') ||
+    errorWithAllColumns.code === '42703'
+  )) {
+    console.warn('Some columns not found, creating session with minimal columns (migration may not be run)');
+    
+    // Try without easy_round_players first
+    const { error: errorWithoutEasyRound } = await supabase.from('game_state').upsert({
+      id: sessionId,
+      session_id: sessionId,
+      admin_id: playerId,
+      phase: defaultState.phase,
+      round_number: defaultState.roundNumber,
+      timer_duration: defaultState.timerDuration,
+      selected_players: defaultState.selectedPlayers,
+      round_winners: defaultState.roundWinners,
+      current_category_image_descr: defaultState.currentCategoryImageDescr,
+    }, { onConflict: 'id' });
+    
+    // If still error about session_id, try without it too
+    if (errorWithoutEasyRound && (
+      errorWithoutEasyRound.message?.toLowerCase().includes('session_id') ||
+      errorWithoutEasyRound.code === '42703'
+    )) {
+      console.warn('session_id column not found, creating session without it');
+      const { error: errorMinimal } = await supabase.from('game_state').upsert({
+        id: sessionId,
+        admin_id: playerId,
+        phase: defaultState.phase,
+        round_number: defaultState.roundNumber,
+        timer_duration: defaultState.timerDuration,
+        selected_players: defaultState.selectedPlayers,
+        round_winners: defaultState.roundWinners,
+        current_category_image_descr: defaultState.currentCategoryImageDescr,
+      }, { onConflict: 'id' });
+      error = errorMinimal;
+    } else {
+      error = errorWithoutEasyRound;
+    }
+  } else {
+    error = errorWithAllColumns;
+  }
+  
+  if (error) {
+    console.error('Session creation error:', error);
+    throw new Error(`Failed to create session: ${error.message}. Please ensure the database migration has been run.`);
+  }
+  
+  return sessionId;
+};
+
+// Verify session exists
+export const verifySession = async (sessionId: string): Promise<boolean> => {
+  const supabase = getSupabaseClient();
+  const { data, error } = await supabase
+    .from('game_state')
+    .select('id')
+    .eq('session_id', sessionId)
+    .single();
+  
+  return !error && !!data;
+};
+
 // Initialize default game state
 export const getDefaultGameState = (): GameState => ({
   adminId: null,
@@ -18,11 +165,14 @@ export const getDefaultGameState = (): GameState => ({
 });
 
 // Helper to convert database state to GameState
-const buildGameState = async (stateData: any): Promise<GameState> => {
+const buildGameState = async (stateData: any, sessionId: string): Promise<GameState> => {
   const supabase = getSupabaseClient();
   
-  // Get players
-  const { data: playersData } = await supabase.from('players').select('*');
+  // Get players for this session
+  const { data: playersData } = await supabase
+    .from('players')
+    .select('*')
+    .eq('session_id', sessionId);
   const players: { [key: string]: Player } = {};
   playersData?.forEach((p: any) => {
     players[p.id] = {
@@ -34,8 +184,11 @@ const buildGameState = async (stateData: any): Promise<GameState> => {
     };
   });
   
-  // Get submissions
-  const { data: submissionsData } = await supabase.from('submissions').select('*');
+  // Get submissions for this session
+  const { data: submissionsData } = await supabase
+    .from('submissions')
+    .select('*')
+    .eq('session_id', sessionId);
   const submissions: { [key: string]: any } = {};
   submissionsData?.forEach((s: any) => {
     submissions[s.player_id] = {
@@ -63,15 +216,15 @@ const buildGameState = async (stateData: any): Promise<GameState> => {
   };
 };
 
-// Claim admin role (first come, first served)
-export const claimAdmin = async (playerId: string): Promise<boolean> => {
+// Claim admin role (first come, first served) - for backward compatibility with 'main' session
+export const claimAdmin = async (playerId: string, sessionId: string = 'main'): Promise<boolean> => {
   const supabase = getSupabaseClient();
   
   // Check if admin already exists
   const { data: existingState } = await supabase
     .from('game_state')
     .select('admin_id')
-    .eq('id', 'main')
+    .eq('session_id', sessionId)
     .single();
   
   if (existingState && existingState.admin_id) {
@@ -82,7 +235,8 @@ export const claimAdmin = async (playerId: string): Promise<boolean> => {
   const { error } = await supabase
     .from('game_state')
     .upsert({
-      id: 'main',
+      id: sessionId,
+      session_id: sessionId,
       admin_id: playerId,
     }, { onConflict: 'id' });
   
@@ -90,10 +244,11 @@ export const claimAdmin = async (playerId: string): Promise<boolean> => {
 };
 
 // Add player to game
-export const addPlayer = async (player: Player): Promise<void> => {
+export const addPlayer = async (player: Player, sessionId: string): Promise<void> => {
   const supabase = getSupabaseClient();
   await supabase.from('players').upsert({
     id: player.id,
+    session_id: sessionId,
     name: player.name,
     icon: player.icon,
     score: player.score,
@@ -102,9 +257,9 @@ export const addPlayer = async (player: Player): Promise<void> => {
 };
 
 // Delete a player (captain only)
-export const deletePlayer = async (playerId: string): Promise<void> => {
+export const deletePlayer = async (playerId: string, sessionId: string): Promise<void> => {
   const supabase = getSupabaseClient();
-  const gameState = await getGameState();
+  const gameState = await getGameState(sessionId);
   
   // Prevent deleting the captain/admin
   if (gameState?.adminId === playerId) {
@@ -115,7 +270,8 @@ export const deletePlayer = async (playerId: string): Promise<void> => {
   const { error: submissionsError } = await supabase
     .from('submissions')
     .delete()
-    .eq('player_id', playerId);
+    .eq('player_id', playerId)
+    .eq('session_id', sessionId);
   
   if (submissionsError) {
     console.error('Error deleting submissions:', submissionsError);
@@ -126,7 +282,8 @@ export const deletePlayer = async (playerId: string): Promise<void> => {
   const { error: playerError } = await supabase
     .from('players')
     .delete()
-    .eq('id', playerId);
+    .eq('id', playerId)
+    .eq('session_id', sessionId);
   
   if (playerError) {
     console.error('Error deleting player:', playerError);
@@ -139,7 +296,7 @@ export const deletePlayer = async (playerId: string): Promise<void> => {
     const { error: updateError } = await supabase
       .from('game_state')
       .update({ selected_players: updatedSelectedPlayers })
-      .eq('id', 'main');
+      .eq('session_id', sessionId);
     
     if (updateError) {
       console.error('Error updating selected players:', updateError);
@@ -152,7 +309,7 @@ export const deletePlayer = async (playerId: string): Promise<void> => {
     const { error: updateError } = await supabase
       .from('game_state')
       .update({ round_winners: updatedRoundWinners })
-      .eq('id', 'main');
+      .eq('session_id', sessionId);
     
     if (updateError) {
       console.error('Error updating round winners:', updateError);
@@ -160,20 +317,62 @@ export const deletePlayer = async (playerId: string): Promise<void> => {
   }
 };
 
+// End the game and logout captain
+export const endGame = async (sessionId: string): Promise<void> => {
+  const supabase = getSupabaseClient();
+  
+  // Set game phase to ended and clear admin
+  const { error } = await supabase
+    .from('game_state')
+    .update({
+      phase: 'game_over',
+      admin_id: null,
+    })
+    .eq('session_id', sessionId);
+  
+  if (error) {
+    console.error('Error ending game:', error);
+    throw new Error(`Failed to end game: ${error.message}`);
+  }
+};
+
+// Transfer captain role to another player
+export const transferCaptain = async (newCaptainId: string, sessionId: string): Promise<void> => {
+  const supabase = getSupabaseClient();
+  const gameState = await getGameState(sessionId);
+  
+  // Verify the new captain exists
+  if (!gameState?.players[newCaptainId]) {
+    throw new Error('Player not found, matey!');
+  }
+  
+  // Transfer captain role
+  const { error } = await supabase
+    .from('game_state')
+    .update({ admin_id: newCaptainId })
+    .eq('session_id', sessionId);
+  
+  if (error) {
+    console.error('Error transferring captain:', error);
+    throw new Error(`Failed to transfer captain: ${error.message}`);
+  }
+};
+
 // Get game state
-export const getGameState = async (): Promise<GameState | null> => {
+export const getGameState = async (sessionId: string = 'main'): Promise<GameState | null> => {
   const supabase = getSupabaseClient();
   const { data, error } = await supabase
     .from('game_state')
     .select('*')
-    .eq('id', 'main')
+    .eq('session_id', sessionId)
     .single();
   
   if (error || !data) {
     // Initialize if doesn't exist
     const defaultState = getDefaultGameState();
     await supabase.from('game_state').upsert({
-      id: 'main',
+      id: sessionId,
+      session_id: sessionId,
       phase: defaultState.phase,
       round_number: defaultState.roundNumber,
       timer_duration: defaultState.timerDuration,
@@ -185,38 +384,38 @@ export const getGameState = async (): Promise<GameState | null> => {
     return defaultState;
   }
   
-  return await buildGameState(data);
+  return await buildGameState(data, sessionId);
 };
 
 // Subscribe to game state changes
-export const subscribeToGameState = (callback: (gameState: GameState) => void) => {
+export const subscribeToGameState = (callback: (gameState: GameState) => void, sessionId: string = 'main') => {
   const supabase = getSupabaseClient();
   
   // Initial state
-  getGameState().then(state => {
+  getGameState(sessionId).then(state => {
     if (state) callback(state);
   });
   
   const channel = supabase
-    .channel('game-state-changes')
+    .channel(`game-state-changes-${sessionId}`)
     .on('postgres_changes', 
-      { event: '*', schema: 'public', table: 'game_state', filter: 'id=eq.main' },
+      { event: '*', schema: 'public', table: 'game_state', filter: `session_id=eq.${sessionId}` },
       async () => {
-        const state = await getGameState();
+        const state = await getGameState(sessionId);
         if (state) callback(state);
       }
     )
     .on('postgres_changes',
-      { event: '*', schema: 'public', table: 'players' },
+      { event: '*', schema: 'public', table: 'players', filter: `session_id=eq.${sessionId}` },
       async () => {
-        const state = await getGameState();
+        const state = await getGameState(sessionId);
         if (state) callback(state);
       }
     )
     .on('postgres_changes',
-      { event: '*', schema: 'public', table: 'submissions' },
+      { event: '*', schema: 'public', table: 'submissions', filter: `session_id=eq.${sessionId}` },
       async () => {
-        const state = await getGameState();
+        const state = await getGameState(sessionId);
         if (state) callback(state);
       }
     )
@@ -238,8 +437,8 @@ const shuffleArray = <T>(array: T[]): T[] => {
 };
 
 // Select 2 random players for the round
-export const selectRandomPlayers = async (): Promise<string[]> => {
-  const gameState = await getGameState();
+export const selectRandomPlayers = async (sessionId: string): Promise<string[]> => {
+  const gameState = await getGameState(sessionId);
   
   if (!gameState || !gameState.players) {
     return [];
@@ -310,8 +509,8 @@ const selectRandomCategory = async (roundType: RoundType): Promise<string | null
 };
 
 // Start a new round
-export const startRound = async (roundType: RoundType): Promise<void> => {
-  const gameState = await getGameState();
+export const startRound = async (roundType: RoundType, sessionId: string): Promise<void> => {
+  const gameState = await getGameState(sessionId);
   const supabase = getSupabaseClient();
   
   // For medium round, only allow top 4 players by score
@@ -334,13 +533,13 @@ export const startRound = async (roundType: RoundType): Promise<void> => {
       .update({
         round_winners: topPlayers,
       })
-      .eq('id', 'main');
+      .eq('session_id', sessionId);
   }
   
   // Randomly select a category description for this round
   const categoryImageDescr = await selectRandomCategory(roundType);
   
-  const selectedPlayers = await selectRandomPlayers();
+  const selectedPlayers = await selectRandomPlayers(sessionId);
   
   await supabase
     .from('game_state')
@@ -350,14 +549,20 @@ export const startRound = async (roundType: RoundType): Promise<void> => {
       selected_players: selectedPlayers,
       current_category_image_descr: categoryImageDescr,
     })
-    .eq('id', 'main');
+    .eq('session_id', sessionId);
   
-  // Clear submissions for new round
-  await supabase.from('submissions').delete().in('player_id', selectedPlayers);
+  // Clear submissions for new round (only for this session)
+  if (selectedPlayers.length > 0) {
+    await supabase
+      .from('submissions')
+      .delete()
+      .in('player_id', selectedPlayers)
+      .eq('session_id', sessionId);
+  }
 };
 
 // Start the timer
-export const startTimer = async (): Promise<void> => {
+export const startTimer = async (sessionId: string): Promise<void> => {
   const supabase = getSupabaseClient();
   await supabase
     .from('game_state')
@@ -365,12 +570,12 @@ export const startTimer = async (): Promise<void> => {
       phase: 'creating',
       timer_started_at: Date.now(),
     })
-    .eq('id', 'main');
+    .eq('session_id', sessionId);
 };
 
 // Check if both players submitted and transition to voting if so
-export const checkSubmissionsAndTransition = async (): Promise<void> => {
-  const gameState = await getGameState();
+export const checkSubmissionsAndTransition = async (sessionId: string): Promise<void> => {
+  const gameState = await getGameState(sessionId);
   
   if (!gameState || gameState.phase !== 'creating') {
     return; // Only check during creating phase
@@ -395,7 +600,7 @@ export const checkSubmissionsAndTransition = async (): Promise<void> => {
         timer_started_at: Date.now(), // Start voting timer
         timer_duration: 60, // 1 minute for voting
       })
-      .eq('id', 'main');
+      .eq('session_id', sessionId);
   }
 };
 
@@ -428,11 +633,11 @@ export const checkAllPlayersVoted = (gameState: GameState): boolean => {
 };
 
 // Submit a vote
-export const submitVote = async (voterId: string, submissionId: string): Promise<void> => {
+export const submitVote = async (voterId: string, submissionId: string, sessionId: string): Promise<void> => {
   const supabase = getSupabaseClient();
   
   // Get current game state first
-  const gameState = await getGameState();
+  const gameState = await getGameState(sessionId);
   if (!gameState || gameState.phase !== 'voting') {
     return; // Not in voting phase
   }
@@ -474,18 +679,18 @@ export const submitVote = async (voterId: string, submissionId: string): Promise
           .update({
             timer_started_at: null, // Stop the timer
           })
-          .eq('id', 'main');
+          .eq('session_id', sessionId);
         
         // Consolidate scores immediately
-        await consolidateVotingScores();
+        await consolidateVotingScores(sessionId);
       }
     }
   }
 };
 
 // Calculate round winner
-export const calculateRoundWinner = async (): Promise<string | null> => {
-  const gameState = await getGameState();
+export const calculateRoundWinner = async (sessionId: string): Promise<string | null> => {
+  const gameState = await getGameState(sessionId);
   
   if (!gameState || !gameState.submissions) {
     return null;
@@ -506,8 +711,8 @@ export const calculateRoundWinner = async (): Promise<string | null> => {
 };
 
 // Advance winner to next round
-export const advanceWinner = async (winnerId: string): Promise<void> => {
-  const gameState = await getGameState();
+export const advanceWinner = async (winnerId: string, sessionId: string): Promise<void> => {
+  const gameState = await getGameState(sessionId);
   const supabase = getSupabaseClient();
   
   const roundWinners = [...(gameState?.roundWinners || []), winnerId];
@@ -523,26 +728,46 @@ export const advanceWinner = async (winnerId: string): Promise<void> => {
     });
   }
   
-  await supabase
+  const { error: updateError } = await supabase
     .from('game_state')
     .update({
       phase: 'results',
       round_winners: roundWinners,
       easy_round_players: easyRoundPlayers,
     })
-    .eq('id', 'main');
+    .eq('session_id', sessionId);
+  
+  // If error is about missing column, retry without easy_round_players
+  if (updateError && (
+    updateError.message?.toLowerCase().includes('easy_round_players') ||
+    updateError.message?.toLowerCase().includes('could not find') ||
+    updateError.message?.toLowerCase().includes('column') && updateError.message?.toLowerCase().includes('game_state') ||
+    updateError.code === '42703'
+  )) {
+    console.warn('easy_round_players column not found, updating without it...');
+    await supabase
+      .from('game_state')
+      .update({
+        phase: 'results',
+        round_winners: roundWinners,
+      })
+      .eq('session_id', sessionId);
+  } else if (updateError) {
+    console.error('Error advancing winner:', updateError);
+    throw new Error(`Failed to advance winner: ${updateError.message}`);
+  }
 };
 
 // Consolidate scores when voting timer completes
-export const consolidateVotingScores = async (): Promise<void> => {
-  const gameState = await getGameState();
+export const consolidateVotingScores = async (sessionId: string): Promise<void> => {
+  const gameState = await getGameState(sessionId);
   const supabase = getSupabaseClient();
   
   if (!gameState || gameState.phase !== 'voting') {
     return; // Only consolidate during voting phase
   }
   
-  const winnerId = await calculateRoundWinner();
+  const winnerId = await calculateRoundWinner(sessionId);
   
   if (!winnerId) {
     // No votes, pick first player as default or handle tie
@@ -553,7 +778,7 @@ export const consolidateVotingScores = async (): Promise<void> => {
         phase: 'results',
         timer_started_at: null, // Stop the timer
       })
-      .eq('id', 'main');
+      .eq('session_id', sessionId);
     return;
   }
   
@@ -563,17 +788,18 @@ export const consolidateVotingScores = async (): Promise<void> => {
     await supabase
       .from('players')
       .update({ score: (winner.score || 0) + 1 })
-      .eq('id', winnerId);
+      .eq('id', winnerId)
+      .eq('session_id', sessionId);
   }
   
   // Advance winner to results phase
-  await advanceWinner(winnerId);
+  await advanceWinner(winnerId, sessionId);
 };
 
 // Reset game
-export const resetGame = async (): Promise<void> => {
+export const resetGame = async (sessionId: string): Promise<void> => {
   const supabase = getSupabaseClient();
-  const gameState = await getGameState();
+  const gameState = await getGameState(sessionId);
   
   const defaultState = getDefaultGameState();
   
@@ -604,10 +830,18 @@ export const resetGame = async (): Promise<void> => {
       easy_round_players: [],
       current_round: null, // Explicitly ensure null
     })
-    .eq('id', 'main');
+    .eq('session_id', sessionId);
   
   // If error is about missing column, retry without easy_round_players
-  if (errorWithEasyRound && errorWithEasyRound.message.includes('easy_round_players')) {
+  // Check for various error message patterns that indicate missing column
+  const isMissingColumnError = errorWithEasyRound && (
+    errorWithEasyRound.message?.toLowerCase().includes('easy_round_players') ||
+    errorWithEasyRound.message?.toLowerCase().includes('could not find') ||
+    errorWithEasyRound.message?.toLowerCase().includes('column') && errorWithEasyRound.message?.toLowerCase().includes('game_state') ||
+    errorWithEasyRound.code === '42703' // PostgreSQL error code for undefined column
+  );
+  
+  if (isMissingColumnError) {
     console.warn('easy_round_players column not found, updating without it...');
     const { error: errorWithoutEasyRound } = await supabase
       .from('game_state')
@@ -615,7 +849,7 @@ export const resetGame = async (): Promise<void> => {
         ...updateData,
         current_round: null, // Explicitly ensure null
       })
-      .eq('id', 'main');
+      .eq('session_id', sessionId);
     updateError = errorWithoutEasyRound;
   } else {
     updateError = errorWithEasyRound;
@@ -630,7 +864,7 @@ export const resetGame = async (): Promise<void> => {
   const { data: verifyData } = await supabase
     .from('game_state')
     .select('current_round, phase')
-    .eq('id', 'main')
+    .eq('session_id', sessionId)
     .single();
   
   if (verifyData && verifyData.current_round !== null) {
@@ -639,26 +873,117 @@ export const resetGame = async (): Promise<void> => {
     await supabase
       .from('game_state')
       .update({ current_round: null })
-      .eq('id', 'main');
+      .eq('session_id', sessionId);
   }
   
-  // Delete all players except the admin
+  // Delete all players except the admin (for this session)
   if (gameState?.adminId) {
     await supabase
       .from('players')
       .delete()
-      .neq('id', gameState.adminId);
+      .neq('id', gameState.adminId)
+      .eq('session_id', sessionId);
   } else {
-    // If no admin, delete all players
+    // If no admin, delete all players for this session
     await supabase
       .from('players')
       .delete()
-      .neq('id', '');
+      .eq('session_id', sessionId);
   }
   
-  // Clear all submissions
+  // Clear all submissions for this session
   await supabase
     .from('submissions')
     .delete()
-    .neq('id', '');
+    .eq('session_id', sessionId);
+};
+
+// Complete reset - clears EVERYTHING including admin (captain only)
+export const completeReset = async (sessionId: string, captainId: string): Promise<void> => {
+  const supabase = getSupabaseClient();
+  
+  // Verify the user is the captain
+  const gameState = await getGameState(sessionId);
+  if (!gameState || gameState.adminId !== captainId) {
+    throw new Error('Only the captain can perform a complete reset!');
+  }
+  
+  const defaultState = getDefaultGameState();
+  
+  // Reset game state completely (including clearing admin)
+  // Try with easy_round_players first, fallback if column doesn't exist
+  const updateData = {
+    phase: defaultState.phase,
+    current_round: null,
+    round_number: 0,
+    selected_players: [],
+    timer_started_at: null,
+    timer_duration: defaultState.timerDuration,
+    round_winners: [],
+    easy_round_players: [],
+    current_category_image_descr: null,
+    admin_id: null, // Clear admin too
+  };
+  
+  const { error: stateErrorWithColumn } = await supabase
+    .from('game_state')
+    .update(updateData)
+    .eq('session_id', sessionId);
+  
+  // Check if error is about missing column
+  const isMissingColumnError = stateErrorWithColumn && (
+    stateErrorWithColumn.message?.toLowerCase().includes('easy_round_players') ||
+    stateErrorWithColumn.message?.toLowerCase().includes('could not find') ||
+    stateErrorWithColumn.message?.toLowerCase().includes('column') && stateErrorWithColumn.message?.toLowerCase().includes('game_state') ||
+    stateErrorWithColumn.code === '42703' // PostgreSQL error code for undefined column
+  );
+  
+  let stateError = stateErrorWithColumn;
+  if (isMissingColumnError) {
+    console.warn('easy_round_players column not found, updating without it...');
+    // Retry without easy_round_players
+    const updateDataWithoutColumn = {
+      phase: updateData.phase,
+      current_round: updateData.current_round,
+      round_number: updateData.round_number,
+      selected_players: updateData.selected_players,
+      timer_started_at: updateData.timer_started_at,
+      timer_duration: updateData.timer_duration,
+      round_winners: updateData.round_winners,
+      current_category_image_descr: updateData.current_category_image_descr,
+      admin_id: updateData.admin_id,
+    };
+    const { error: stateErrorWithoutColumn } = await supabase
+      .from('game_state')
+      .update(updateDataWithoutColumn)
+      .eq('session_id', sessionId);
+    stateError = stateErrorWithoutColumn;
+  }
+  
+  if (stateError) {
+    console.error('Error resetting game state:', stateError);
+    throw new Error(`Failed to reset game state: ${stateError.message}`);
+  }
+  
+  // Delete ALL players for this session
+  const { error: playersError } = await supabase
+    .from('players')
+    .delete()
+    .eq('session_id', sessionId);
+  
+  if (playersError) {
+    console.error('Error deleting players:', playersError);
+    throw new Error(`Failed to delete players: ${playersError.message}`);
+  }
+  
+  // Clear ALL submissions for this session
+  const { error: submissionsError } = await supabase
+    .from('submissions')
+    .delete()
+    .eq('session_id', sessionId);
+  
+  if (submissionsError) {
+    console.error('Error deleting submissions:', submissionsError);
+    // Don't throw, as this is less critical
+  }
 };

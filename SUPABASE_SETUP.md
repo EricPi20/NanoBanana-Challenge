@@ -63,3 +63,4 @@ npm run dev
 
 That's it! Your game should now work with Supabase! 🎉
 
+

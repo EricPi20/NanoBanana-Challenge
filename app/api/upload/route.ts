@@ -7,6 +7,7 @@ export async function POST(request: NextRequest) {
     const formData = await request.formData();
     const file = formData.get('file') as File;
     const playerId = formData.get('playerId') as string;
+    const sessionId = (formData.get('sessionId') as string) || 'main';
 
     if (!file || !playerId) {
       return NextResponse.json(
@@ -35,9 +36,10 @@ export async function POST(request: NextRequest) {
       .from('submissions')
       .getPublicUrl(filename);
 
-    // Save submission to database
+    // Save submission to database with session_id
     const { error: dbError } = await supabase.from('submissions').upsert({
       id: playerId,
+      session_id: sessionId,
       player_id: playerId,
       image_url: publicUrl,
       uploaded_at: Date.now(),
@@ -50,7 +52,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Check if both players have submitted and transition to voting if so
-    await checkSubmissionsAndTransition();
+    await checkSubmissionsAndTransition(sessionId);
 
     return NextResponse.json({
       success: true,
